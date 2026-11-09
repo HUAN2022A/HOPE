@@ -4,8 +4,8 @@
 
 This module assembles a single MuJoCo model that contains
 
-  * the shipped ``a3_pingpong`` robot (loaded verbatim from its MJCF -- no copy of
-    the robot model lives here), and
+  * the shipped ``a3_pingpong`` robot articulation (loaded from its MJCF -- no
+    copy lives here; inherited Gate3 table/net geometry is disabled), and
   * a static **table top**, **net** and **floor** contact surface, plus a dynamic
     **ball** (free joint, sphere), all sized/placed and given contact restitution +
     friction from ``configs/ball_physics.yaml``.
@@ -133,6 +133,7 @@ class PingPongRealPhysicsScene:
         self.drag_k = float(drag.get("k", 0.1261))
         self.velocity_clip = float(drag.get("velocity_clip", 50.0))
         self.gravity = g
+        self.table_restitution = float(ball_cfg.get("contact", {}).get("table", {}).get("restitution", 0.9215))
 
         self.near_edge_x = float(near_edge_x)
         # mujoco_world -> table_frame is a pure translation by this offset.
@@ -189,6 +190,16 @@ class PingPongRealPhysicsScene:
     def _build_model(self, mujoco, robot_xml_path, ball_cfg) -> None:
         spec = mujoco.MjSpec.from_file(str(robot_xml_path))
         wb = spec.worldbody
+
+        # The current robot MJCF also embeds the native Gate3 arena, in a
+        # different table frame. This standalone scene owns its own table/net.
+        # Do not let the inherited table intersect the robot at reset, or show
+        # a second arena. Keep the named geoms for the source model's pairs.
+        for geom in spec.geoms:
+            if geom.name in {"gate3_table_visual", "gate3_table_collision", "gate3_net_collision"}:
+                geom.contype = 0
+                geom.conaffinity = 0
+                geom.rgba = [0.0, 0.0, 0.0, 0.0]
 
         # Collision bitmasks: the ball collides with the racket (already in the
         # robot model) + our table/net, but our table/net do NOT collide with the

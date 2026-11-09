@@ -85,6 +85,18 @@ class SwingLifecycle:
     def _can_engage(self) -> bool:
         return self.phase in (Phase.READY, Phase.RECOVERY)
 
+    def cancel_active_task(self, task_id: int) -> bool:
+        """Recover when an incoming ball loses its actionable intercept.
+
+        Preserve task identity, robot state and policy history. Cancellation
+        applies only before the strike; completed swings keep their follow-through.
+        """
+        if self.active_task_id != task_id or self.phase != Phase.SWING:
+            return False
+        self.phase = Phase.RECOVERY
+        self._recover_t = 0.0
+        return True
+
     # -- main tick ----------------------------------------------------------
     def update(self, cmd: RacketCommand | None, state: RobotState) -> ObsTarget:
         c = self.cfg

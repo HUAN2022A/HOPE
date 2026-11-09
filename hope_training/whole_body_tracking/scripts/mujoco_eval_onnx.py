@@ -140,34 +140,52 @@ def _predict_command(ball_pos, ball_vel, side, scene, physics, args, task_id, re
     """Lightweight inline no-spin intercept predictor -> a RacketCommand.
 
     Forward-integrates the true ball with the shared no-spin model (gravity +
-    quadratic drag) until it crosses the fixed strike plane, producing the racket
-    target position (where the ball will be), the time-to-strike, and a target racket
+    quadratic drag + table bounce) until it crosses the fixed strike plane,
+    producing the racket target position (where the ball will be), the time-to-strike, and a target racket
     velocity aimed at the fixed opponent-half landing point. ``swing_sign`` is the
     side locked for this task (harness-internal target semantics only — the policy
     never observes it). This mirrors the planner's job but reads the ball directly
     (the evaluator is the ground truth, so no mocap emulation is needed).
+    Returns None if no future above-table intercept is available.
     """
     strike_x = scene.near_edge_x + args.strike_plane_x
     p = np.asarray(ball_pos, dtype=np.float64).copy()
     v = np.asarray(ball_vel, dtype=np.float64).copy()
+    surface_z = scene.table_height + physics.ball_radius
+    if (not np.all(np.isfinite(p)) or not np.all(np.isfinite(v))
+            or p[0] <= strike_x or v[0] >= 0.0 or p[2] < surface_z):
+        return None
     dt = 0.002
     t = 0.0
-    y_cross, z_cross, tts = float(p[1]), float(p[2]), 0.0
+    crossing = None
     for _ in range(int(2.0 / dt)):
         a = physics.acceleration(v)
         p_new = p + v * dt + 0.5 * a * dt * dt
         v_new = v + a * dt
+        # The physical incoming ball bounces before reaching the hit plane.
+        # Omitting that bounce sends the actor an underground target (seed 0:
+        # z=-0.77 m), although the actual ball is still above the tabletop.
+        if p[2] > surface_z >= p_new[2] and v_new[2] < 0.0:
+            frac = (surface_z - p[2]) / (p_new[2] - p[2])
+            bounce = p + frac * (p_new - p)
+            on_table = (scene.near_edge_x <= bounce[0] <= scene.near_edge_x + scene.length
+                        and abs(bounce[1]) <= scene.width / 2.0)
+            if on_table:
+                p_new[2] = surface_z + (surface_z - p_new[2])
+                v_new[2] *= -scene.table_restitution
         if p[0] >= strike_x > p_new[0]:  # ball moving -x through the strike plane
             dx = p_new[0] - p[0]
             frac = (strike_x - p[0]) / dx if abs(dx) > 1e-12 else 0.5
-            y_cross = float(p[1] + frac * (p_new[1] - p[1]))
-            z_cross = float(p[2] + frac * (p_new[2] - p[2]))
+            crossing = p + frac * (p_new - p)
             tts = t + frac * dt
             break
         p, v = p_new, v_new
         t += dt
 
-    target_pos = np.array([strike_x, y_cross, z_cross], dtype=np.float64)
+    # A departed/out-of-play ball is not a new strike with time_to_strike=0.
+    if crossing is None or crossing[2] <= surface_z:
+        return None
+    target_pos = np.array([strike_x, crossing[1], crossing[2]], dtype=np.float64)
 
     # Target racket velocity: the ballistic velocity that would send the ball from the
     # strike point to the fixed opponent-half landing target in a fixed time.
@@ -297,6 +315,8 @@ def run_eval(args) -> dict:
     transitions_seen: set = set()
     prev_side = None
     task_counter = 0
+    rejected_commands = 0
+    cancelled_tasks = 0
 
     for trial in range(args.num_serves):
         # Side pattern FH, FH, BH, BH, ... exercises all four adjacent side
@@ -339,7 +359,14 @@ def run_eval(args) -> dict:
                 ball_pos, ball_vel, side, scene, physics, args, task_id, revision, RacketCommand
             )
             revision += 1
-            source.submit(cmd)
+            if cmd is None:
+                # Holding a formerly valid target for a ball that can no longer
+                # reach it can drive a late, unsupported swing. Recover without
+                # changing the robot state or its applied-action history.
+                rejected_commands += 1
+                cancelled_tasks += int(lifecycle.cancel_active_task(task_id))
+            else:
+                source.submit(cmd)
 
             events, last_action = _policy_tick(lifecycle, source, last_action, base_target_xy)
 
@@ -397,7 +424,8 @@ def run_eval(args) -> dict:
         )
     print(
         f"[mujoco_eval] mode={args.eval_mode} serves={accumulator.attempts} "
-        f"returns={accumulator.successes} success_rate={accumulator.value:.4f}",
+        f"returns={accumulator.successes} success_rate={accumulator.value:.4f} "
+        f"rejected_commands={rejected_commands} cancelled_tasks={cancelled_tasks}",
         file=sys.stderr,
     )
     return accumulator.as_dict()
